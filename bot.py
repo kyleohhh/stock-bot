@@ -13,15 +13,14 @@ load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 
-# Channel ID where live prices will be posted (set in .env or replace directly)
+# Channel ID where live prices will be posted
 PRICE_CHANNEL_ID = int(os.getenv("PRICE_CHANNEL_ID", "0"))
 
 # Stocks to track in the live feed (edit freely)
 TRACKED_STOCKS = ["AAPL", "TSLA", "NVDA", "SPY"]
 
-# How often to update prices (seconds). Polygon free tier: 1 req/min per stock
+# How often to update prices (seconds)
 UPDATE_INTERVAL = 60
 
 # File to persist alerts across restarts
@@ -32,11 +31,11 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# In-memory alert storage: {alert_id: {user_id, channel_id, ticker, condition, price}}
+# In-memory alert storage
 alerts: dict = {}
 alert_counter = 0
 
-# Cache last known prices to detect crossings
+# Cache last known prices
 price_cache: dict = {}
 
 
@@ -55,13 +54,20 @@ def save_alerts():
         json.dump({"alerts": alerts, "counter": alert_counter}, f, indent=2)
 
 async def get_price(session: aiohttp.ClientSession, ticker: str) -> float | None:
-    """Fetch the latest trade price from Polygon.io."""
-    url = f"https://api.polygon.io/v2/last/trade/{ticker.upper()}?apiKey={POLYGON_API_KEY}"
+    """Fetch the latest price from Yahoo Finance (unofficial API)."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}?interval=1m&range=1d"
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                return data["results"]["p"]  # last trade price
+                result = data["chart"]["result"]
+                if result:
+                    meta = result[0]["meta"]
+                    # Use regularMarketPrice for current/last price
+                    price = meta.get("regularMarketPrice")
+                    if price:
+                        return float(price)
     except Exception as e:
         print(f"[price fetch error] {ticker}: {e}")
     return None
@@ -118,14 +124,13 @@ async def update_prices():
             description="\n".join(lines),
             color=0x00C853 if is_market_open() else 0x607D8B,
         )
-        embed.set_footer(text=f"Updated {ts}  •  Powered by Polygon.io")
+        embed.set_footer(text=f"Updated {ts}  •  Powered by Yahoo Finance")
 
         # Try to edit the last pinned message, otherwise send a new one
         try:
-            pinned = await channel.pins()
-            bot_pins = [m for m in pinned if m.author == bot.user and m.embeds]
-            if bot_pins:
-                await bot_pins[0].edit(embed=embed)
+            pinned = [message async for message in channel.history(limit=50) if message.author == bot.user and message.pinned]
+            if pinned:
+                await pinned[0].edit(embed=embed)
             else:
                 msg = await channel.send(embed=embed)
                 await msg.pin()
@@ -289,6 +294,4 @@ async def on_ready():
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise ValueError("DISCORD_TOKEN not set in environment")
-    if not POLYGON_API_KEY:
-        raise ValueError("POLYGON_API_KEY not set in environment")
     bot.run(DISCORD_TOKEN)
