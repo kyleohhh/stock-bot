@@ -18,7 +18,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 PRICE_CHANNEL_ID = int(os.getenv("PRICE_CHANNEL_ID", "0"))
 
 # Stocks to track in the live feed (edit freely)
-TRACKED_STOCKS = ["AAPL", "TSLA", "NVDA", "SPY"]
+TRACKED_STOCKS = ["SPCX", "TSLA", "NVDA", "SPY"]
 
 # How often to update prices (seconds)
 UPDATE_INTERVAL = 60
