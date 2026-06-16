@@ -168,27 +168,14 @@ async def get_price(session: aiohttp.ClientSession, ticker: str):
         return None
 
 def format_price_line(ticker: str, data) -> str:
-    """Format a single ticker line for the embed description."""
+    """Format a single ticker line for the watchlist field: price, $ change, % change."""
     if data is None:
         return f"`{ticker:<5}` — unavailable"
     arrow = "▲" if data["change"] >= 0 else "▼"
     dot = "🟢" if data["change"] >= 0 else "🔴"
     return (
-        f"{dot} `{ticker:<5}` **${data['price']:,.2f}**  "
-        f"{arrow} {data['change']:+.2f} ({data['change_pct']:+.2f}%)  "
-        f"*as of {data['as_of']}*"
-    )
-
-def format_holding_line(ticker: str, shares: float, data) -> str:
-    """Format a single holding row: ticker, shares, price, position value, % change."""
-    if data is None:
-        return f"`{ticker:<5}` {shares:,.0f} sh — unavailable"
-    value = shares * data["price"]
-    arrow = "▲" if data["change"] >= 0 else "▼"
-    dot = "🟢" if data["change"] >= 0 else "🔴"
-    return (
-        f"{dot} `{ticker:<5}` {shares:,.0f} sh  @ **${data['price']:,.2f}**  "
-        f"→ **${value:,.2f}**  {arrow} {data['change_pct']:+.2f}%"
+        f"{dot} `{ticker:<5}` **${data['price']:,.2f}** "
+        f"{arrow} {data['change']:+.2f} ({data['change_pct']:+.2f}%)"
     )
 
 def is_market_open() -> bool:
@@ -228,14 +215,12 @@ async def update_prices():
             if price is not None:
                 price_cache[ticker] = price
 
-        # Build portfolio summary, if there are any holdings
-        portfolio_lines = []
+        # Build portfolio totals, if there are any holdings
         total_value = 0.0
         total_prev_value = 0.0
         any_unavailable = False
         for ticker, shares in holdings.items():
             data = holding_data.get(ticker)
-            portfolio_lines.append(format_holding_line(ticker, shares, data))
             if data is not None:
                 total_value += shares * data["price"]
                 total_prev_value += shares * data["prev_close"]
@@ -246,23 +231,28 @@ async def update_prices():
         session_label, embed_color = get_session_label()
         ts = format_time_no_leading_zero(datetime.now(ET), "%I:%M:%S %p ET")
         embed = discord.Embed(
-            title=f"📈 Live Stock Feed  •  {session_label}",
-            description="\n".join(lines),
+            title=f"📈 Live Feed  •  {session_label}",
             color=embed_color,
+        )
+
+        embed.add_field(
+            name="Watchlist",
+            value="\n".join(lines) if lines else "—",
+            inline=True,
         )
 
         if holdings:
             total_change = total_value - total_prev_value
             total_change_pct = (total_change / total_prev_value) * 100 if total_prev_value else 0
             arrow = "▲" if total_change >= 0 else "▼"
-            warn = "  ⚠️ *some holdings unavailable*" if any_unavailable else ""
+            warn = "\n⚠️ *some holdings unavailable*" if any_unavailable else ""
             embed.add_field(
-                name="💼 Portfolio",
+                name="Portfolio",
                 value=(
-                    f"**${total_value:,.2f}**  {arrow} {total_change:+,.2f} "
-                    f"({total_change_pct:+.2f}%){warn}\n" + "\n".join(portfolio_lines)
+                    f"**${total_value:,.2f}**\n"
+                    f"{arrow} {total_change:+,.2f} ({total_change_pct:+.2f}%){warn}"
                 ),
-                inline=False,
+                inline=True,
             )
 
         embed.set_footer(text=f"Updated {ts}  •  Powered by Yahoo Finance")
