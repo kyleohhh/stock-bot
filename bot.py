@@ -85,13 +85,15 @@ def get_session_label() -> tuple:
 
 async def get_price(session: aiohttp.ClientSession, ticker: str):
     """
-    Fetch price from Yahoo Finance's chart API (free, real-time).
-    Returns the most current price 24/7 by checking session and falling back
-    through preMarketPrice / postMarketPrice / regularMarketPrice as appropriate —
-    Robinhood-style always-on last price.
+    Fetch price from Yahoo Finance's quote API (free, real-time).
+    Unlike the basic chart endpoint, this one exposes `marketState` (PRE, REGULAR,
+    POST, POSTPOST, CLOSED) and keeps `regularMarketPrice` updated to the latest
+    tradeable price in every session — including the overnight/POSTPOST session
+    some tickers (e.g. newly-listed or heavily-traded names) carry on ECNs after
+    the standard post-market window ends. This gives a true 24/7 last price.
     Returns a dict on success, None on failure.
     """
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}?interval=1m&range=1d"
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker.upper()}"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -100,33 +102,38 @@ async def get_price(session: aiohttp.ClientSession, ticker: str):
                 return None
             data = await resp.json()
 
-        result = data.get("chart", {}).get("result")
+        result = data.get("quoteResponse", {}).get("result")
         if not result:
             return None
 
-        meta = result[0]["meta"]
+        q = result[0]
 
-        regular_price = meta.get("regularMarketPrice")
-        prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
-        pre_price = meta.get("preMarketPrice")
-        post_price = meta.get("postMarketPrice")
-        pre_time = meta.get("preMarketTime")          # Unix seconds
-        post_time = meta.get("postMarketTime")          # Unix seconds
-        regular_time = meta.get("regularMarketTime")    # Unix seconds
+        market_state = q.get("marketState", "")  # PRE, REGULAR, POST, POSTPOST, CLOSED
+        regular_price = q.get("regularMarketPrice")
+        prev_close = q.get("regularMarketPreviousClose")
+        regular_time = q.get("regularMarketTime")  # Unix seconds
+
+        pre_price = q.get("preMarketPrice")
+        pre_time = q.get("preMarketTime")
+        post_price = q.get("postMarketPrice")
+        post_time = q.get("postMarketTime")
 
         if regular_price is None or prev_close is None:
             return None
 
-        label, _ = get_session_label()
-
-        # Pick the most relevant price for the current session
-        if "Pre-Market" in label and pre_price is not None:
+        # Pick the freshest available price based on reported market state.
+        # POSTPOST and any other non-standard state falls through to "most recent timestamp"
+        # since Yahoo doesn't expose a separate field name for every overnight session type.
+        if market_state == "PRE" and pre_price is not None:
             last_price, last_ts = pre_price, pre_time
-        elif "After-Hours" in label and post_price is not None:
+        elif market_state == "POST" and post_price is not None:
             last_price, last_ts = post_price, post_time
+        elif market_state == "REGULAR":
+            last_price, last_ts = regular_price, regular_time
         else:
-            # Market open, or closed with no fresher extended-hours data —
-            # use whichever timestamp is most recent among what's available
+            # POSTPOST, CLOSED, or unknown state — use whichever timestamp is most recent.
+            # In POSTPOST, Yahoo often keeps regularMarketPrice itself updated to the
+            # overnight trade price, so it's included as a candidate too.
             candidates = [
                 (regular_time, regular_price),
                 (post_time, post_price),
@@ -151,6 +158,7 @@ async def get_price(session: aiohttp.ClientSession, ticker: str):
             "change": change,
             "change_pct": change_pct,
             "as_of": as_of,
+            "market_state": market_state,
         }
 
     except Exception as e:
@@ -163,10 +171,20 @@ def format_price_line(ticker: str, data) -> str:
         return f"`{ticker:<5}` — unavailable"
     arrow = "▲" if data["change"] >= 0 else "▼"
     dot = "🟢" if data["change"] >= 0 else "🔴"
+
+    state = data.get("market_state", "")
+    state_tag = ""
+    if state == "POSTPOST":
+        state_tag = "  🌌 *overnight*"
+    elif state == "PRE":
+        state_tag = "  🌅 *pre-market*"
+    elif state == "POST":
+        state_tag = "  🌙 *after-hours*"
+
     return (
         f"{dot} `{ticker:<5}` **${data['price']:,.2f}**  "
         f"{arrow} {data['change']:+.2f} ({data['change_pct']:+.2f}%)  "
-        f"*as of {data['as_of']}*"
+        f"*as of {data['as_of']}*{state_tag}"
     )
 
 def is_market_open() -> bool:
@@ -267,12 +285,19 @@ async def price_cmd(interaction: discord.Interaction, ticker: str):
     if data is None:
         await interaction.followup.send(f"❌ Could not fetch price for `{ticker.upper()}`. Check the ticker or try again.")
     else:
-        session_label, _ = get_session_label()
+        state_labels = {
+            "PRE": "🌅 Pre-Market",
+            "REGULAR": "🟢 Market Open",
+            "POST": "🌙 After-Hours",
+            "POSTPOST": "🌌 Overnight",
+            "CLOSED": "🔴 Market Closed",
+        }
+        state_label = state_labels.get(data.get("market_state", ""), "")
         arrow = "▲" if data["change"] >= 0 else "▼"
         await interaction.followup.send(
             f"`{data['ticker']}` **${data['price']:,.2f}**  "
             f"{arrow} {data['change']:+.2f} ({data['change_pct']:+.2f}%) vs prev close  "
-            f"| {session_label}  •  *as of {data['as_of']}*"
+            f"| {state_label}  •  *as of {data['as_of']}*"
         )
 
 
