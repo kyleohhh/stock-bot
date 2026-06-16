@@ -488,7 +488,13 @@ async def on_ready():
     # Create one persistent session for the bot's lifetime so cookies from the
     # Yahoo crumb handshake are retained between price fetches.
     if http_session is None:
-        http_session = aiohttp.ClientSession()
+        # Yahoo's homepage response includes very large security headers (CSP, etc.)
+        # that exceed aiohttp's default 8190-byte header line limit, causing the
+        # crumb handshake to fail outright. Raising these limits fixes it.
+        http_session = aiohttp.ClientSession(
+            max_line_size=2**15,
+            max_field_size=2**15,
+        )
 
     try:
         synced = await tree.sync()
