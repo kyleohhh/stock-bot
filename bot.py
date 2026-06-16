@@ -41,12 +41,6 @@ alert_counter = 0
 # Cache last known prices (used for alert comparisons)
 price_cache: dict = {}
 
-# Yahoo Finance auth cache — crumb token, refreshed when stale.
-# Uses a persistent session (created in on_ready) so cookies survive between calls,
-# which is required for the crumb-based auth to keep working.
-_yahoo_crumb: str | None = None
-http_session: aiohttp.ClientSession | None = None
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -63,10 +57,7 @@ def save_alerts():
         json.dump({"alerts": alerts, "counter": alert_counter}, f, indent=2)
 
 def format_time_no_leading_zero(dt: datetime, fmt: str) -> str:
-    """
-    Cross-platform alternative to %-I / %#I (which differ between Linux and Windows).
-    Formats with %I (zero-padded) then strips a leading zero if present.
-    """
+    """Cross-platform alternative to %-I / %#I, which differ between Linux and Windows."""
     s = dt.strftime(fmt)
     return s.replace(" 0", " ", 1) if " 0" in s else s
 
@@ -89,54 +80,25 @@ def get_session_label() -> tuple:
     else:
         return "🔴 Market Closed", 0x607D8B
 
-async def get_yahoo_crumb(session: aiohttp.ClientSession) -> str | None:
+async def get_price(session: aiohttp.ClientSession, ticker: str):
     """
-    Yahoo's v7/finance/quote endpoint now requires a session cookie + crumb token,
-    mimicking what a real browser does. We fetch the homepage to collect the cookie,
-    then call the crumb endpoint to get the token. Cached at module level until
-    a request fails, since the crumb stays valid for a while.
-    """
-    global _yahoo_crumb
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
-    try:
-        # Step 1: hit the homepage so aiohttp's cookie jar picks up Yahoo's session cookie
-        async with session.get("https://fc.yahoo.com", headers=headers, timeout=aiohttp.ClientTimeout(total=10)):
-            pass
-        async with session.get("https://finance.yahoo.com", headers=headers, timeout=aiohttp.ClientTimeout(total=10)):
-            pass
-
-        # Step 2: request the crumb using that same cookie-bearing session
-        async with session.get(
-            "https://query2.finance.yahoo.com/v1/test/getcrumb",
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            if resp.status == 200:
-                crumb = (await resp.text()).strip()
-                if crumb and "Invalid" not in crumb:
-                    _yahoo_crumb = crumb
-                    return crumb
-    except Exception as e:
-        print(f"[crumb fetch error] {e}")
-    return None
-
-async def get_price_v8_fallback(session: aiohttp.ClientSession, ticker: str):
-    """
-    Reliable fallback using the chart endpoint (no auth required). Doesn't carry
-    the overnight/POSTPOST session, but always works — used when the
-    crumb-authenticated v7 call fails for any reason, so the bot never goes dark.
+    Fetch price from Yahoo Finance's chart API (free, no auth required).
+    Covers regular market hours plus standard pre-market (4-9:30am ET) and
+    after-hours (4-8pm ET) sessions. Returns a dict on success, None on failure.
     """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}?interval=1m&range=1d"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
+                print(f"[yahoo error] {ticker}: HTTP {resp.status}")
                 return None
             data = await resp.json()
 
         result = data.get("chart", {}).get("result")
         if not result:
             return None
+
         meta = result[0]["meta"]
 
         regular_price = meta.get("regularMarketPrice")
@@ -150,6 +112,7 @@ async def get_price_v8_fallback(session: aiohttp.ClientSession, ticker: str):
         if regular_price is None or prev_close is None:
             return None
 
+        # Use whichever price field has the most recent timestamp
         candidates = [
             (regular_time, regular_price),
             (post_time, post_price),
@@ -160,7 +123,12 @@ async def get_price_v8_fallback(session: aiohttp.ClientSession, ticker: str):
 
         change = last_price - prev_close
         change_pct = (change / prev_close) * 100 if prev_close else 0
-        as_of = format_time_no_leading_zero(datetime.fromtimestamp(last_ts, tz=ET), "%a %I:%M %p ET") if last_ts else "unknown"
+
+        if last_ts:
+            dt = datetime.fromtimestamp(last_ts, tz=ET)
+            as_of = format_time_no_leading_zero(dt, "%a %I:%M %p ET")
+        else:
+            as_of = "unknown"
 
         return {
             "ticker": ticker.upper(),
@@ -169,84 +137,11 @@ async def get_price_v8_fallback(session: aiohttp.ClientSession, ticker: str):
             "change": change,
             "change_pct": change_pct,
             "as_of": as_of,
-            "market_state": "",  # unknown precise state on this fallback path
         }
+
     except Exception as e:
-        print(f"[v8 fallback error] {ticker}: {e}")
+        print(f"[price fetch error] {ticker}: {e}")
         return None
-
-async def get_price(session: aiohttp.ClientSession, ticker: str):
-    """
-    Fetch price from Yahoo Finance, preferring the authenticated v7/quote endpoint
-    (exposes marketState including overnight/POSTPOST sessions) and falling back
-    to the unauthenticated v8/chart endpoint if the crumb handshake fails.
-    Returns a dict on success, None on failure.
-    """
-    global _yahoo_crumb
-
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
-
-    # Make sure we have a crumb before trying the authenticated endpoint
-    if _yahoo_crumb is None:
-        await get_yahoo_crumb(session)
-
-    if _yahoo_crumb:
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker.upper()}&crumb={_yahoo_crumb}"
-        try:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    result = data.get("quoteResponse", {}).get("result")
-                    if result:
-                        q = result[0]
-                        market_state = q.get("marketState", "")
-                        regular_price = q.get("regularMarketPrice")
-                        prev_close = q.get("regularMarketPreviousClose")
-                        regular_time = q.get("regularMarketTime")
-                        pre_price = q.get("preMarketPrice")
-                        pre_time = q.get("preMarketTime")
-                        post_price = q.get("postMarketPrice")
-                        post_time = q.get("postMarketTime")
-
-                        if regular_price is not None and prev_close is not None:
-                            # Always pick whichever field has the most recent timestamp,
-                            # rather than trusting marketState to match the freshest field.
-                            # Yahoo doesn't always keep marketState in sync with which price
-                            # field actually has the latest trade (e.g. during overnight/
-                            # POSTPOST sessions, regularMarketPrice itself gets updated but
-                            # marketState may still read "POST").
-                            candidates = [
-                                (regular_time, regular_price),
-                                (post_time, post_price),
-                                (pre_time, pre_price),
-                            ]
-                            candidates = [(t, p) for t, p in candidates if t is not None and p is not None]
-                            last_ts, last_price = max(candidates, key=lambda x: x[0]) if candidates else (regular_time, regular_price)
-
-                            change = last_price - prev_close
-                            change_pct = (change / prev_close) * 100 if prev_close else 0
-                            as_of = format_time_no_leading_zero(datetime.fromtimestamp(last_ts, tz=ET), "%a %I:%M %p ET") if last_ts else "unknown"
-
-                            return {
-                                "ticker": ticker.upper(),
-                                "price": float(last_price),
-                                "prev_close": float(prev_close),
-                                "change": change,
-                                "change_pct": change_pct,
-                                "as_of": as_of,
-                                "market_state": market_state,
-                            }
-                elif resp.status == 401:
-                    # Crumb went stale — clear it so the next call refreshes it
-                    print(f"[yahoo error] {ticker}: HTTP 401, refreshing crumb next call")
-                    _yahoo_crumb = None
-                else:
-                    print(f"[yahoo error] {ticker}: HTTP {resp.status}")
-        except Exception as e:
-            print(f"[price fetch error] {ticker}: {e}")
-
-    # Fallback: reliable, unauthenticated endpoint (no overnight data, but never fails)
-    return await get_price_v8_fallback(session, ticker)
 
 def format_price_line(ticker: str, data) -> str:
     """Format a single ticker line for the embed description."""
@@ -254,43 +149,11 @@ def format_price_line(ticker: str, data) -> str:
         return f"`{ticker:<5}` — unavailable"
     arrow = "▲" if data["change"] >= 0 else "▼"
     dot = "🟢" if data["change"] >= 0 else "🔴"
-
-    state_tag = get_state_tag(data)
-
     return (
         f"{dot} `{ticker:<5}` **${data['price']:,.2f}**  "
         f"{arrow} {data['change']:+.2f} ({data['change_pct']:+.2f}%)  "
-        f"*as of {data['as_of']}*{state_tag}"
+        f"*as of {data['as_of']}*"
     )
-
-def get_state_tag(data) -> str:
-    """
-    Returns a display tag (' 🌌 *overnight*', etc.) based on the actual clock time
-    of the price's timestamp, not Yahoo's marketState string — which can lag behind
-    which field (regular/post/pre) actually holds the freshest trade.
-    """
-    as_of = data.get("as_of", "")
-    if as_of in ("", "unknown"):
-        return ""
-    try:
-        # as_of looks like "Mon 8:00 PM ET" — parse just the time portion
-        time_part = as_of.rsplit(" ", 1)[0]  # drop trailing "ET"
-        time_part = time_part.split(" ", 1)[1]  # drop leading weekday
-        parsed = datetime.strptime(time_part, "%I:%M %p")
-        minutes = parsed.hour * 60 + parsed.minute
-    except Exception:
-        return ""
-
-    if minutes < 240:        # Midnight – 4:00 AM
-        return "  🌌 *overnight*"
-    elif minutes < 570:      # 4:00 AM – 9:30 AM
-        return "  🌅 *pre-market*"
-    elif minutes < 960:      # 9:30 AM – 4:00 PM
-        return ""            # regular hours, no tag needed
-    elif minutes < 1200:     # 4:00 PM – 8:00 PM
-        return "  🌙 *after-hours*"
-    else:                    # 8:00 PM – Midnight
-        return "  🌌 *overnight*"
 
 def is_market_open() -> bool:
     """Rough check — NYSE hours Mon-Fri 9:30–16:00 ET."""
@@ -307,73 +170,71 @@ async def update_prices():
     channel = bot.get_channel(PRICE_CHANNEL_ID)
     if channel is None:
         return
-    if http_session is None:
-        return
 
-    session = http_session
-    lines = []
-    new_prices = {}
+    async with aiohttp.ClientSession() as session:
+        lines = []
+        new_prices = {}
 
-    for ticker in TRACKED_STOCKS:
-        data = await get_price(session, ticker)
-        new_prices[ticker] = data["price"] if data else None
-        lines.append(format_price_line(ticker, data))
+        for ticker in TRACKED_STOCKS:
+            data = await get_price(session, ticker)
+            new_prices[ticker] = data["price"] if data else None
+            lines.append(format_price_line(ticker, data))
 
-    # Update cache (used by alert checks below)
-    for ticker, price in new_prices.items():
-        if price is not None:
-            price_cache[ticker] = price
+        # Update cache (used by alert checks below)
+        for ticker, price in new_prices.items():
+            if price is not None:
+                price_cache[ticker] = price
 
-    # Build embed
-    session_label, embed_color = get_session_label()
-    ts = format_time_no_leading_zero(datetime.now(ET), "%I:%M:%S %p ET")
-    embed = discord.Embed(
-        title=f"📈 Live Stock Feed  •  {session_label}",
-        description="\n".join(lines),
-        color=embed_color,
-    )
-    embed.set_footer(text=f"Updated {ts}  •  Powered by Yahoo Finance")
+        # Build embed
+        session_label, embed_color = get_session_label()
+        ts = format_time_no_leading_zero(datetime.now(ET), "%I:%M:%S %p ET")
+        embed = discord.Embed(
+            title=f"📈 Live Stock Feed  •  {session_label}",
+            description="\n".join(lines),
+            color=embed_color,
+        )
+        embed.set_footer(text=f"Updated {ts}  •  Powered by Yahoo Finance")
 
-    # Try to edit the last pinned message, otherwise send a new one
-    try:
-        pinned = [message async for message in channel.history(limit=50) if message.author == bot.user and message.pinned]
-        if pinned:
-            await pinned[0].edit(embed=embed)
-        else:
-            msg = await channel.send(embed=embed)
-            await msg.pin()
-    except Exception as e:
-        print(f"[update_prices error] {e}")
+        # Try to edit the last pinned message, otherwise send a new one
+        try:
+            pinned = [message async for message in channel.history(limit=50) if message.author == bot.user and message.pinned]
+            if pinned:
+                await pinned[0].edit(embed=embed)
+            else:
+                msg = await channel.send(embed=embed)
+                await msg.pin()
+        except Exception as e:
+            print(f"[update_prices error] {e}")
 
-    # ── Check Alerts ──────────────────────────────────────────────────────
-    triggered = []
-    for alert_id, alert in alerts.items():
-        ticker = alert["ticker"]
-        price = new_prices.get(ticker)
-        if price is None:
-            continue
-        condition = alert["condition"]
-        target = alert["price"]
-        hit = (condition == "above" and price >= target) or \
-              (condition == "below" and price <= target)
-        if hit:
-            triggered.append(alert_id)
-            try:
-                alert_channel = bot.get_channel(alert["channel_id"])
-                if alert_channel:
-                    await alert_channel.send(
-                        f"🚨 <@{alert['user_id']}> **Alert triggered!** "
-                        f"`{ticker}` is now **${price:,.2f}** "
-                        f"({'above' if condition == 'above' else 'below'} your ${target:,.2f} target)"
-                    )
-            except Exception as e:
-                print(f"[alert send error] {e}")
+        # ── Check Alerts ──────────────────────────────────────────────────────
+        triggered = []
+        for alert_id, alert in alerts.items():
+            ticker = alert["ticker"]
+            price = new_prices.get(ticker)
+            if price is None:
+                continue
+            condition = alert["condition"]
+            target = alert["price"]
+            hit = (condition == "above" and price >= target) or \
+                  (condition == "below" and price <= target)
+            if hit:
+                triggered.append(alert_id)
+                try:
+                    alert_channel = bot.get_channel(alert["channel_id"])
+                    if alert_channel:
+                        await alert_channel.send(
+                            f"🚨 <@{alert['user_id']}> **Alert triggered!** "
+                            f"`{ticker}` is now **${price:,.2f}** "
+                            f"({'above' if condition == 'above' else 'below'} your ${target:,.2f} target)"
+                        )
+                except Exception as e:
+                    print(f"[alert send error] {e}")
 
-    # Remove triggered alerts
-    for alert_id in triggered:
-        del alerts[alert_id]
-    if triggered:
-        save_alerts()
+        # Remove triggered alerts
+        for alert_id in triggered:
+            del alerts[alert_id]
+        if triggered:
+            save_alerts()
 
 
 @update_prices.before_loop
@@ -387,19 +248,17 @@ async def before_update():
 @app_commands.describe(ticker="Stock ticker symbol, e.g. AAPL")
 async def price_cmd(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer()
-    if http_session is None:
-        await interaction.followup.send("❌ Bot is still starting up, try again in a moment.")
-        return
-    data = await get_price(http_session, ticker.upper())
+    async with aiohttp.ClientSession() as session:
+        data = await get_price(session, ticker.upper())
     if data is None:
         await interaction.followup.send(f"❌ Could not fetch price for `{ticker.upper()}`. Check the ticker or try again.")
     else:
-        state_tag = get_state_tag(data).strip() or "🟢 Market Open"
+        session_label, _ = get_session_label()
         arrow = "▲" if data["change"] >= 0 else "▼"
         await interaction.followup.send(
             f"`{data['ticker']}` **${data['price']:,.2f}**  "
             f"{arrow} {data['change']:+.2f} ({data['change_pct']:+.2f}%) vs prev close  "
-            f"| {state_tag}  •  *as of {data['as_of']}*"
+            f"| {session_label}  •  *as of {data['as_of']}*"
         )
 
 
@@ -495,27 +354,13 @@ async def untrack_cmd(interaction: discord.Interaction, ticker: str):
 
 @bot.event
 async def on_ready():
-    global http_session
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
     load_alerts()
-
-    # Create one persistent session for the bot's lifetime so cookies from the
-    # Yahoo crumb handshake are retained between price fetches.
-    if http_session is None:
-        # Yahoo's homepage response includes very large security headers (CSP, etc.)
-        # that exceed aiohttp's default 8190-byte header line limit, causing the
-        # crumb handshake to fail outright. Raising these limits fixes it.
-        http_session = aiohttp.ClientSession(
-            max_line_size=2**15,
-            max_field_size=2**15,
-        )
-
     try:
         synced = await tree.sync()
         print(f"✅ Synced {len(synced)} slash commands")
     except Exception as e:
         print(f"❌ Slash command sync failed: {e}")
-
     if not update_prices.is_running():
         update_prices.start()
 
