@@ -18,16 +18,13 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 PRICE_CHANNEL_ID = int(os.getenv("PRICE_CHANNEL_ID", "0"))
 
 # Stocks to track in the live feed (edit freely)
-TRACKED_STOCKS = ["SPCX", "TSLA", "NVDA", "SPY"]
+TRACKED_STOCKS = ["AAPL", "TSLA", "NVDA", "SPY"]
 
 # How often to update prices (seconds)
 UPDATE_INTERVAL = 60
 
 # File to persist alerts across restarts
 ALERTS_FILE = "alerts.json"
-
-# Eastern timezone
-ET = pytz.timezone("America/New_York")
 
 # ── Bot Setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -56,117 +53,44 @@ def save_alerts():
     with open(ALERTS_FILE, "w") as f:
         json.dump({"alerts": alerts, "counter": alert_counter}, f, indent=2)
 
-def get_session_label() -> tuple:
-    """Returns (session label string, embed color int) based on current ET time."""
-    now = datetime.now(ET)
-    t = now.hour * 60 + now.minute
-    wd = now.weekday()  # 0=Mon, 6=Sun
-
-    if wd >= 5:
-        return "🔴 Market Closed", 0x607D8B
-    if t < 240:
-        return "🔴 Market Closed", 0x607D8B
-    elif t < 570:
-        return "🌅 Pre-Market", 0xFFA726
-    elif t < 960:
-        return "🟢 Market Open", 0x00C853
-    elif t < 1200:
-        return "🌙 After-Hours", 0x5C6BC0
-    else:
-        return "🔴 Market Closed", 0x607D8B
-
-async def get_price(session: aiohttp.ClientSession, ticker: str):
-    """
-    Fetch price from Yahoo Finance chart API (free, real-time).
-    Pulls regularMarketPrice + preMarketPrice + postMarketPrice from `meta`
-    so the bot can show 24/7 last price, Robinhood-style.
-    Returns a dict on success, None on failure.
-    """
+async def get_price(session: aiohttp.ClientSession, ticker: str) -> float | None:
+    """Fetch the latest price from Yahoo Finance (unofficial API)."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}?interval=1m&range=1d"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                print(f"[yahoo error] {ticker}: HTTP {resp.status}")
-                return None
-            data = await resp.json()
-
-        result = data.get("chart", {}).get("result")
-        if not result:
-            return None
-
-        meta = result[0]["meta"]
-
-        regular_price = meta.get("regularMarketPrice")
-        prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
-        pre_price = meta.get("preMarketPrice")
-        post_price = meta.get("postMarketPrice")
-        pre_time = meta.get("preMarketTime")        # Unix seconds
-        post_time = meta.get("postMarketTime")       # Unix seconds
-        regular_time = meta.get("regularMarketTime") # Unix seconds
-
-        if regular_price is None or prev_close is None:
-            return None
-
-        # Determine which price is most current based on session
-        label, _ = get_session_label()
-        if "Pre-Market" in label and pre_price is not None:
-            last_price = pre_price
-            last_ts = pre_time
-        elif "After-Hours" in label and post_price is not None:
-            last_price = post_price
-            last_ts = post_time
-        else:
-            # Market open or closed with no extended data — fall back to regular price,
-            # but if closed and post-market data exists (e.g. just went quiet), prefer the freshest timestamp
-            candidates = [
-                (regular_time, regular_price),
-                (post_time, post_price),
-                (pre_time, pre_price),
-            ]
-            candidates = [(t, p) for t, p in candidates if t is not None and p is not None]
-            last_ts, last_price = max(candidates, key=lambda x: x[0]) if candidates else (regular_time, regular_price)
-
-        change = last_price - prev_close
-        change_pct = (change / prev_close) * 100 if prev_close else 0
-
-        if last_ts:
-            dt = datetime.fromtimestamp(last_ts, tz=ET)
-            as_of = dt.strftime("%a %I:%M %p ET").replace(" 0", " ")
-        else:
-            as_of = "unknown"
-
-        return {
-            "ticker": ticker.upper(),
-            "price": float(last_price),
-            "prev_close": float(prev_close),
-            "change": change,
-            "change_pct": change_pct,
-            "as_of": as_of,
-        }
-
+            if resp.status == 200:
+                data = await resp.json()
+                result = data["chart"]["result"]
+                if result:
+                    meta = result[0]["meta"]
+                    # Use regularMarketPrice for current/last price
+                    price = meta.get("regularMarketPrice")
+                    if price:
+                        return float(price)
     except Exception as e:
         print(f"[price fetch error] {ticker}: {e}")
-        return None
+    return None
 
-def format_price_line(ticker: str, data) -> str:
-    """Format a single ticker line for the embed description."""
-    if data is None:
+def format_price_line(ticker: str, price: float | None, prev: float | None) -> str:
+    if price is None:
         return f"`{ticker:<5}` — unavailable"
-    arrow = "▲" if data["change"] >= 0 else "▼"
-    color = "🟢" if data["change"] >= 0 else "🔴"
-    return (
-        f"{color} `{ticker:<5}` **${data['price']:,.2f}**  "
-        f"{arrow} {data['change']:+.2f} ({data['change_pct']:+.2f}%)  "
-        f"*as of {data['as_of']}*"
-    )
+    arrow = ""
+    if prev is not None:
+        change = price - prev
+        pct = (change / prev) * 100
+        arrow = f"  {'🟢 +' if change >= 0 else '🔴 '}{change:+.2f} ({pct:+.2f}%)"
+    return f"`{ticker:<5}` **${price:,.2f}**{arrow}"
 
 def is_market_open() -> bool:
     """Rough check — NYSE hours Mon-Fri 9:30–16:00 ET."""
-    now = datetime.now(ET)
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
     if now.weekday() >= 5:
         return False
-    return time(9, 30) <= now.time() <= time(16, 0)
+    market_open = time(9, 30)
+    market_close = time(16, 0)
+    return market_open <= now.time() <= market_close
 
 
 # ── Background Tasks ──────────────────────────────────────────────────────────
@@ -182,22 +106,23 @@ async def update_prices():
         new_prices = {}
 
         for ticker in TRACKED_STOCKS:
-            data = await get_price(session, ticker)
-            new_prices[ticker] = data["price"] if data else None
-            lines.append(format_price_line(ticker, data))
+            price = await get_price(session, ticker)
+            prev = price_cache.get(ticker)
+            new_prices[ticker] = price
+            lines.append(format_price_line(ticker, price, prev))
 
-        # Update cache (store raw price float for alert checks)
+        # Update cache
         for ticker, price in new_prices.items():
             if price is not None:
                 price_cache[ticker] = price
 
         # Build embed
-        session_label, embed_color = get_session_label()
-        ts = datetime.now(ET).strftime("%I:%M:%S %p ET")
+        status = "🟢 Market Open" if is_market_open() else "🔴 Market Closed"
+        ts = datetime.now(pytz.timezone("America/New_York")).strftime("%I:%M:%S %p ET")
         embed = discord.Embed(
-            title=f"📈 Live Stock Feed  •  {session_label}",
+            title=f"📈 Live Stock Feed  •  {status}",
             description="\n".join(lines),
-            color=embed_color,
+            color=0x00C853 if is_market_open() else 0x607D8B,
         )
         embed.set_footer(text=f"Updated {ts}  •  Powered by Yahoo Finance")
 
@@ -255,17 +180,11 @@ async def before_update():
 async def price_cmd(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer()
     async with aiohttp.ClientSession() as session:
-        data = await get_price(session, ticker.upper())
-    if data is None:
+        p = await get_price(session, ticker.upper())
+    if p is None:
         await interaction.followup.send(f"❌ Could not fetch price for `{ticker.upper()}`. Check the ticker or try again.")
     else:
-        session_label, _ = get_session_label()
-        arrow = "▲" if data["change"] >= 0 else "▼"
-        await interaction.followup.send(
-            f"`{data['ticker']}` **${data['price']:,.2f}**  "
-            f"{arrow} {data['change']:+.2f} ({data['change_pct']:+.2f}%) vs prev close  "
-            f"| {session_label}  •  *as of {data['as_of']}*"
-        )
+        await interaction.followup.send(f"`{ticker.upper()}` is currently **${p:,.2f}**")
 
 
 @tree.command(name="alert", description="Set a price alert for a stock")
