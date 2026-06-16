@@ -227,33 +227,39 @@ async def update_prices():
             else:
                 any_unavailable = True
 
-        # Build embed
+        # Build embed — portfolio leads, watchlist follows underneath
         session_label, embed_color = get_session_label()
         ts = format_time_no_leading_zero(datetime.now(ET), "%I:%M:%S %p ET")
-        embed = discord.Embed(
-            title=f"📈 Live Feed  •  {session_label}",
-            color=embed_color,
-        )
 
-        embed.add_field(
-            name="Watchlist",
-            value="\n".join(lines) if lines else "—",
-            inline=True,
-        )
-
+        description_parts = []
         if holdings:
             total_change = total_value - total_prev_value
             total_change_pct = (total_change / total_prev_value) * 100 if total_prev_value else 0
             arrow = "▲" if total_change >= 0 else "▼"
-            warn = "\n⚠️ *some holdings unavailable*" if any_unavailable else ""
-            embed.add_field(
-                name="Portfolio",
-                value=(
-                    f"**${total_value:,.2f}**\n"
-                    f"{arrow} {total_change:+,.2f} ({total_change_pct:+.2f}%){warn}"
-                ),
-                inline=True,
+            warn = "  ⚠️ *some holdings unavailable*" if any_unavailable else ""
+            description_parts.append(
+                f"**${total_value:,.2f}**  {arrow} {total_change:+,.2f} "
+                f"({total_change_pct:+.2f}%){warn}"
             )
+            for ticker, shares in holdings.items():
+                data = holding_data.get(ticker)
+                if data is not None:
+                    dot = "🟢" if data["change"] >= 0 else "🔴"
+                    description_parts.append(f"{dot} `{ticker}` {shares:,.0f} sh @ ${data['price']:,.2f}")
+                else:
+                    description_parts.append(f"`{ticker}` {shares:,.0f} sh — unavailable")
+
+        embed = discord.Embed(
+            title=f"💼 Portfolio  •  {session_label}",
+            description="\n".join(description_parts) if description_parts else "No holdings set. Use `/addholding` to add one.",
+            color=embed_color,
+        )
+
+        embed.add_field(
+            name="📈 Watchlist",
+            value="\n".join(lines) if lines else "—",
+            inline=False,
+        )
 
         embed.set_footer(text=f"Updated {ts}  •  Powered by Yahoo Finance")
 
