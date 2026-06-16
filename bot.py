@@ -26,6 +26,14 @@ UPDATE_INTERVAL = 60
 # File to persist alerts across restarts
 ALERTS_FILE = "alerts.json"
 
+# File to persist portfolio holdings across restarts
+HOLDINGS_FILE = "holdings.json"
+
+# Seed holdings (ticker: shares) — edit freely, or manage via /addholding and /removeholding
+DEFAULT_HOLDINGS = {
+    "SPCX": 48570,
+}
+
 # Eastern timezone (NYSE/NASDAQ trading hours)
 ET = pytz.timezone("America/New_York")
 
@@ -37,6 +45,9 @@ tree = bot.tree
 # In-memory alert storage
 alerts: dict = {}
 alert_counter = 0
+
+# Portfolio holdings: {ticker: shares}
+holdings: dict = {}
 
 # Cache last known prices (used for alert comparisons)
 price_cache: dict = {}
@@ -55,6 +66,19 @@ def load_alerts():
 def save_alerts():
     with open(ALERTS_FILE, "w") as f:
         json.dump({"alerts": alerts, "counter": alert_counter}, f, indent=2)
+
+def load_holdings():
+    global holdings
+    if os.path.exists(HOLDINGS_FILE):
+        with open(HOLDINGS_FILE) as f:
+            holdings = json.load(f)
+    else:
+        holdings = dict(DEFAULT_HOLDINGS)
+        save_holdings()
+
+def save_holdings():
+    with open(HOLDINGS_FILE, "w") as f:
+        json.dump(holdings, f, indent=2)
 
 def format_time_no_leading_zero(dt: datetime, fmt: str) -> str:
     """Cross-platform alternative to %-I / %#I, which differ between Linux and Windows."""
@@ -155,6 +179,18 @@ def format_price_line(ticker: str, data) -> str:
         f"*as of {data['as_of']}*"
     )
 
+def format_holding_line(ticker: str, shares: float, data) -> str:
+    """Format a single holding row: ticker, shares, price, position value, % change."""
+    if data is None:
+        return f"`{ticker:<5}` {shares:,.0f} sh — unavailable"
+    value = shares * data["price"]
+    arrow = "▲" if data["change"] >= 0 else "▼"
+    dot = "🟢" if data["change"] >= 0 else "🔴"
+    return (
+        f"{dot} `{ticker:<5}` {shares:,.0f} sh  @ **${data['price']:,.2f}**  "
+        f"→ **${value:,.2f}**  {arrow} {data['change_pct']:+.2f}%"
+    )
+
 def is_market_open() -> bool:
     """Rough check — NYSE hours Mon-Fri 9:30–16:00 ET."""
     now = datetime.now(ET)
@@ -180,10 +216,31 @@ async def update_prices():
             new_prices[ticker] = data["price"] if data else None
             lines.append(format_price_line(ticker, data))
 
+        # Fetch prices for each holding (separate from TRACKED_STOCKS, may overlap)
+        holding_data = {}
+        for ticker in holdings:
+            holding_data[ticker] = await get_price(session, ticker)
+            if holding_data[ticker] is not None:
+                new_prices[ticker] = holding_data[ticker]["price"]
+
         # Update cache (used by alert checks below)
         for ticker, price in new_prices.items():
             if price is not None:
                 price_cache[ticker] = price
+
+        # Build portfolio summary, if there are any holdings
+        portfolio_lines = []
+        total_value = 0.0
+        total_prev_value = 0.0
+        any_unavailable = False
+        for ticker, shares in holdings.items():
+            data = holding_data.get(ticker)
+            portfolio_lines.append(format_holding_line(ticker, shares, data))
+            if data is not None:
+                total_value += shares * data["price"]
+                total_prev_value += shares * data["prev_close"]
+            else:
+                any_unavailable = True
 
         # Build embed
         session_label, embed_color = get_session_label()
@@ -193,6 +250,21 @@ async def update_prices():
             description="\n".join(lines),
             color=embed_color,
         )
+
+        if holdings:
+            total_change = total_value - total_prev_value
+            total_change_pct = (total_change / total_prev_value) * 100 if total_prev_value else 0
+            arrow = "▲" if total_change >= 0 else "▼"
+            warn = "  ⚠️ *some holdings unavailable*" if any_unavailable else ""
+            embed.add_field(
+                name="💼 Portfolio",
+                value=(
+                    f"**${total_value:,.2f}**  {arrow} {total_change:+,.2f} "
+                    f"({total_change_pct:+.2f}%){warn}\n" + "\n".join(portfolio_lines)
+                ),
+                inline=False,
+            )
+
         embed.set_footer(text=f"Updated {ts}  •  Powered by Yahoo Finance")
 
         # Try to edit the last pinned message, otherwise send a new one
@@ -350,12 +422,50 @@ async def untrack_cmd(interaction: discord.Interaction, ticker: str):
         await interaction.response.send_message(f"`{t}` isn't being tracked.", ephemeral=True)
 
 
+@tree.command(name="addholding", description="Add or update a portfolio holding")
+@app_commands.describe(ticker="Stock ticker, e.g. SPCX", shares="Total shares you hold (replaces any existing amount)")
+async def add_holding_cmd(interaction: discord.Interaction, ticker: str, shares: float):
+    if shares <= 0:
+        await interaction.response.send_message("❌ Shares must be a positive number.", ephemeral=True)
+        return
+    t = ticker.upper()
+    holdings[t] = shares
+    save_holdings()
+    await interaction.response.send_message(
+        f"✅ Holding set: `{t}` — **{shares:,.0f} shares**",
+        ephemeral=True
+    )
+
+
+@tree.command(name="removeholding", description="Remove a stock from your portfolio tracker")
+@app_commands.describe(ticker="Stock ticker to remove")
+async def remove_holding_cmd(interaction: discord.Interaction, ticker: str):
+    t = ticker.upper()
+    if t in holdings:
+        del holdings[t]
+        save_holdings()
+        await interaction.response.send_message(f"🗑️ `{t}` removed from your portfolio.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"`{t}` isn't in your portfolio.", ephemeral=True)
+
+
+@tree.command(name="portfolio", description="View your current portfolio holdings")
+async def portfolio_cmd(interaction: discord.Interaction):
+    if not holdings:
+        await interaction.response.send_message("No holdings set yet. Use `/addholding` to add one.", ephemeral=True)
+        return
+    lines = [f"`{t}` — {s:,.0f} shares" for t, s in holdings.items()]
+    embed = discord.Embed(title="Your Portfolio Holdings", description="\n".join(lines), color=0x5865F2)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ── Bot Events ────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
     load_alerts()
+    load_holdings()
     try:
         synced = await tree.sync()
         print(f"✅ Synced {len(synced)} slash commands")
