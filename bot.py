@@ -241,13 +241,6 @@ async def update_prices():
                 f"**${total_value:,.2f}**  {arrow} {total_change:+,.2f} "
                 f"({total_change_pct:+.2f}%){warn}"
             )
-            for ticker, shares in holdings.items():
-                data = holding_data.get(ticker)
-                if data is not None:
-                    dot = "🟢" if data["change"] >= 0 else "🔴"
-                    description_parts.append(f"{dot} `{ticker}` {shares:,.0f} sh @ ${data['price']:,.2f}")
-                else:
-                    description_parts.append(f"`{ticker}` {shares:,.0f} sh — unavailable")
 
         embed = discord.Embed(
             title=f"💼 Portfolio  •  {session_label}",
