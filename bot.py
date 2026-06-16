@@ -209,20 +209,19 @@ async def get_price(session: aiohttp.ClientSession, ticker: str):
                         post_time = q.get("postMarketTime")
 
                         if regular_price is not None and prev_close is not None:
-                            if market_state == "PRE" and pre_price is not None:
-                                last_price, last_ts = pre_price, pre_time
-                            elif market_state == "POST" and post_price is not None:
-                                last_price, last_ts = post_price, post_time
-                            elif market_state == "REGULAR":
-                                last_price, last_ts = regular_price, regular_time
-                            else:
-                                candidates = [
-                                    (regular_time, regular_price),
-                                    (post_time, post_price),
-                                    (pre_time, pre_price),
-                                ]
-                                candidates = [(t, p) for t, p in candidates if t is not None and p is not None]
-                                last_ts, last_price = max(candidates, key=lambda x: x[0]) if candidates else (regular_time, regular_price)
+                            # Always pick whichever field has the most recent timestamp,
+                            # rather than trusting marketState to match the freshest field.
+                            # Yahoo doesn't always keep marketState in sync with which price
+                            # field actually has the latest trade (e.g. during overnight/
+                            # POSTPOST sessions, regularMarketPrice itself gets updated but
+                            # marketState may still read "POST").
+                            candidates = [
+                                (regular_time, regular_price),
+                                (post_time, post_price),
+                                (pre_time, pre_price),
+                            ]
+                            candidates = [(t, p) for t, p in candidates if t is not None and p is not None]
+                            last_ts, last_price = max(candidates, key=lambda x: x[0]) if candidates else (regular_time, regular_price)
 
                             change = last_price - prev_close
                             change_pct = (change / prev_close) * 100 if prev_close else 0
@@ -256,20 +255,42 @@ def format_price_line(ticker: str, data) -> str:
     arrow = "▲" if data["change"] >= 0 else "▼"
     dot = "🟢" if data["change"] >= 0 else "🔴"
 
-    state = data.get("market_state", "")
-    state_tag = ""
-    if state == "POSTPOST":
-        state_tag = "  🌌 *overnight*"
-    elif state == "PRE":
-        state_tag = "  🌅 *pre-market*"
-    elif state == "POST":
-        state_tag = "  🌙 *after-hours*"
+    state_tag = get_state_tag(data)
 
     return (
         f"{dot} `{ticker:<5}` **${data['price']:,.2f}**  "
         f"{arrow} {data['change']:+.2f} ({data['change_pct']:+.2f}%)  "
         f"*as of {data['as_of']}*{state_tag}"
     )
+
+def get_state_tag(data) -> str:
+    """
+    Returns a display tag (' 🌌 *overnight*', etc.) based on the actual clock time
+    of the price's timestamp, not Yahoo's marketState string — which can lag behind
+    which field (regular/post/pre) actually holds the freshest trade.
+    """
+    as_of = data.get("as_of", "")
+    if as_of in ("", "unknown"):
+        return ""
+    try:
+        # as_of looks like "Mon 8:00 PM ET" — parse just the time portion
+        time_part = as_of.rsplit(" ", 1)[0]  # drop trailing "ET"
+        time_part = time_part.split(" ", 1)[1]  # drop leading weekday
+        parsed = datetime.strptime(time_part, "%I:%M %p")
+        minutes = parsed.hour * 60 + parsed.minute
+    except Exception:
+        return ""
+
+    if minutes < 240:        # Midnight – 4:00 AM
+        return "  🌌 *overnight*"
+    elif minutes < 570:      # 4:00 AM – 9:30 AM
+        return "  🌅 *pre-market*"
+    elif minutes < 960:      # 9:30 AM – 4:00 PM
+        return ""            # regular hours, no tag needed
+    elif minutes < 1200:     # 4:00 PM – 8:00 PM
+        return "  🌙 *after-hours*"
+    else:                    # 8:00 PM – Midnight
+        return "  🌌 *overnight*"
 
 def is_market_open() -> bool:
     """Rough check — NYSE hours Mon-Fri 9:30–16:00 ET."""
@@ -373,19 +394,12 @@ async def price_cmd(interaction: discord.Interaction, ticker: str):
     if data is None:
         await interaction.followup.send(f"❌ Could not fetch price for `{ticker.upper()}`. Check the ticker or try again.")
     else:
-        state_labels = {
-            "PRE": "🌅 Pre-Market",
-            "REGULAR": "🟢 Market Open",
-            "POST": "🌙 After-Hours",
-            "POSTPOST": "🌌 Overnight",
-            "CLOSED": "🔴 Market Closed",
-        }
-        state_label = state_labels.get(data.get("market_state", ""), "")
+        state_tag = get_state_tag(data).strip() or "🟢 Market Open"
         arrow = "▲" if data["change"] >= 0 else "▼"
         await interaction.followup.send(
             f"`{data['ticker']}` **${data['price']:,.2f}**  "
             f"{arrow} {data['change']:+.2f} ({data['change_pct']:+.2f}%) vs prev close  "
-            f"| {state_label}  •  *as of {data['as_of']}*"
+            f"| {state_tag}  •  *as of {data['as_of']}*"
         )
 
 
